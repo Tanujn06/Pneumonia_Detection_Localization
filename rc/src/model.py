@@ -3,9 +3,17 @@ model.py - DenseNet121 Binary Classifier for Pneumonia Detection
 Author: Member 2
 """
 
+import ssl
 import torch
 import torch.nn as nn
 from torchvision import models
+
+# Ensure SSL certificate resolution for downloading pretrained weights across all OS environments
+try:
+    import certifi
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 
 class PneumoniaDenseNet121(nn.Module):
@@ -47,7 +55,7 @@ def get_model(pretrained: bool = True, drop_rate: float = 0.2) -> nn.Module:
 
 
 if __name__ == '__main__':
-    model = get_model(pretrained=False)
+    model = get_model(pretrained=True)
     dummy_input = torch.randn(2, 3, 224, 224)
     out = model(dummy_input)
-    print(f'Model loaded successfully! Output logit shape: {out.shape}')
+    print(f"Model loaded successfully! Output logit shape: {out.shape}")
