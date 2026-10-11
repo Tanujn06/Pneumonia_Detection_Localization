@@ -2,7 +2,7 @@
 evaluate.py - Final Evaluation Pipeline on held-out test.csv
 Loads best_model.pth checkpoint, evaluates once on test.csv,
 and exports all required metrics, confusion matrix, and ROC curve to Google Drive.
-Supports Validation-tuned optimal threshold and Test-Time Augmentation (TTA).
+Supports custom threshold, threshold sweep, and Test-Time Augmentation (TTA).
 Author: Member 2
 """
 
@@ -43,9 +43,9 @@ except ImportError:
     from src.dataset import PneumoniaDataset
 
 
-def get_test_transforms():
+def get_test_transforms(img_size=224):
     return transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -141,8 +141,9 @@ def evaluate():
                         default="/content/drive/MyDrive/Pneumonia_Project/results",
                         help="Directory on Drive to save evaluation figures and JSON")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Default probability threshold")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Classification probability threshold")
     parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (horizontal flip)")
+    parser.add_argument("--sweep", action="store_true", help="Print threshold sweep table to see accuracy across thresholds")
     args = parser.parse_args()
 
     # Device selection
@@ -183,7 +184,6 @@ def evaluate():
 
         best_val_acc = 0.0
         best_th = 0.5
-        # Search thresholds to maximize validation accuracy
         for th in np.linspace(0.25, 0.75, 101):
             preds = (val_probs >= th).astype(int)
             acc_th = (preds == val_targets).mean()
@@ -192,7 +192,7 @@ def evaluate():
                 best_th = float(th)
 
         chosen_threshold = best_th
-        print(f"  >>> Optimal Threshold found on validation set: {chosen_threshold:.4f} (Val Accuracy: {best_val_acc * 100:.2f}%)")
+        print(f"  >>> Optimal Threshold on validation set: {chosen_threshold:.4f} (Val Accuracy: {best_val_acc * 100:.2f}%)")
 
     # 3. Test Dataset & DataLoader
     test_dataset = PneumoniaDataset(args.test_csv, args.img_dir, transform=test_transform)
@@ -200,6 +200,24 @@ def evaluate():
     print(f"Running inference across held-out test set ({len(test_dataset)} cases)...")
 
     all_targets, all_probs = predict_loader(model, test_loader, device, tta=args.tta)
+
+    # Threshold Sweep Table (if requested)
+    if args.sweep:
+        print("\n" + "="*65)
+        print("                 ACCURACY THRESHOLD SWEEP TABLE")
+        print("="*65)
+        print(f"{'Threshold':<12} | {'Accuracy':<12} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10}")
+        print("-" * 65)
+        for th in np.arange(0.40, 0.75, 0.02):
+            preds_th = (all_probs >= th).astype(int)
+            acc_th = accuracy_score(all_targets, preds_th)
+            prec_th = precision_score(all_targets, preds_th, zero_division=0)
+            rec_th = recall_score(all_targets, preds_th, zero_division=0)
+            f1_th = f1_score(all_targets, preds_th, zero_division=0)
+            mark = " ★" if acc_th >= 0.88 else ""
+            print(f"{th:<12.2f} | {acc_th*100:<10.2f}%{mark:<1} | {prec_th:<10.4f} | {rec_th:<10.4f} | {f1_th:<10.4f}")
+        print("="*65)
+
     all_preds = (all_probs >= chosen_threshold).astype(int)
 
     # 4. Compute Metrics
