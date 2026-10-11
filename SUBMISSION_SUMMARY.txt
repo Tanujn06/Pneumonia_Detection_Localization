@@ -1,0 +1,48 @@
+================================================================================
+PNEUMONIA DETECTION & LOCALIZATION - FINAL SUBMISSION REPORT
+Component: Member 2 (Model Training & Held-Out Test Evaluation)
+Date: 2026-10-11 22:18:05
+GitHub Branch: feature/model
+GitHub Repo: https://github.com/Tanujn06/Pneumonia_Detection_Localization
+================================================================================
+
+1. MODEL ARCHITECTURE & CONFIGURATION
+--------------------------------------------------------------------------------
+- Base Network: DenseNet-121 (Torchvision ImageNet Pretrained initialization)
+- Classifier Head: Single Linear Logit Output (nn.Linear(1024, 1))
+- Loss Function: BCEWithLogitsLoss (numerically stable binary cross-entropy)
+- Optimizer: Adam (Initial LR: 1e-4, Weight Decay: 1e-5)
+- Parameter Count: 6,954,881 trainable parameters
+
+2. MODEL SELECTION & INTEGRITY (ZERO TEST LEAKAGE)
+--------------------------------------------------------------------------------
+- Training Set: metadata/train.csv (21,347 patient cases)
+- Validation Set: metadata/val.csv (2,668 patient cases)
+- Held-Out Test Set: metadata/test.csv (2,669 patient cases)
+- Optimization Protocol: Checkpoint saved strictly when Validation ROC-AUC improved.
+- Model Selection Rule: Held-out test set was evaluated ONCE after training completed.
+- Checkpoint: checkpoints/best_model.pth (saved directly to Google Drive)
+
+3. FINAL HELD-OUT TEST EVALUATION RESULTS (2,669 CASES)
+--------------------------------------------------------------------------------
+  Test Accuracy:        91.20% (0.9120)
+  Validation / Test AUC:0.9285
+  Recall (Sensitivity): 90.35% (0.9035)
+  Precision:            75.42% (0.7542)
+  Specificity:          91.44% (0.9144)
+  F1-Score:             82.21% (0.8221)
+
+  Confusion Matrix [[TN, FP], [FN, TP]]:
+  [[1891,  177],
+   [  58,  543]]
+
+4. SUBMISSION DELIVERABLES & ARTIFACTS
+--------------------------------------------------------------------------------
+  - Checkpoint File:    checkpoints/best_model.pth (in Google Drive)
+  - Training History:   checkpoints/training_logs.txt (in Google Drive)
+  - Metrics JSON:       results/test_metrics.json
+  - Confusion Matrix:   results/confusion_matrix.png
+  - ROC Curve Plot:     results/roc_curve.png
+  - Source Scripts:     rc/src/model.py, rc/src/train.py, rc/src/evaluate.py
+  - Colab Notebook:     Member_2_Model_Training_and_Evaluation.ipynb
+================================================================================
