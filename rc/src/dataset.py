@@ -1,7 +1,6 @@
-
 from pathlib import Path
-
 import numpy as np
+import pandas as pd
 import pydicom
 import torch
 from PIL import Image
@@ -48,6 +47,8 @@ class PneumoniaDataset(Dataset):
         patient_col="patientId",
         label_col="Target",
     ):
+        if isinstance(metadata, (str, Path)):
+            metadata = pd.read_csv(metadata)
         self.metadata = metadata.reset_index(drop=True).copy()
         self.image_dir = Path(image_dir)
         self.transform = transform or T.Compose([
@@ -65,14 +66,21 @@ class PneumoniaDataset(Dataset):
     def __getitem__(self, index):
         row = self.metadata.iloc[index]
         patient_id = str(row[self.patient_col])
+        
+        # Check for .dcm extension or standard image formats
         image_path = self.image_dir / f"{patient_id}.dcm"
-
+        if not image_path.exists():
+            image_path = self.image_dir / patient_id
         if not image_path.exists():
             raise FileNotFoundError(
-                f"X-ray not found: {image_path}"
+                f"X-ray not found: {self.image_dir / f'{patient_id}.dcm'}"
             )
 
-        image = Image.fromarray(read_xray(image_path)).convert("RGB")
+        if str(image_path).endswith(".dcm"):
+            image = Image.fromarray(read_xray(image_path)).convert("RGB")
+        else:
+            image = Image.open(image_path).convert("RGB")
+
         image = self.transform(image)
 
         label = torch.tensor(
@@ -81,4 +89,3 @@ class PneumoniaDataset(Dataset):
         )
 
         return image, label, patient_id
-
