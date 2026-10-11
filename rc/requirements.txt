@@ -1,1 +1,11 @@
-
+torch>=2.0
+torchvision>=0.15
+pydicom>=2.4
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+pillow
+certifi
+streamlit>=1.50
