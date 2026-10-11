@@ -2,6 +2,7 @@
 evaluate.py - Final Evaluation Pipeline on held-out test.csv
 Loads best_model.pth checkpoint, evaluates once on test.csv,
 and exports all required metrics, confusion matrix, and ROC curve to Google Drive.
+Supports Validation-tuned optimal threshold and Test-Time Augmentation (TTA).
 Author: Member 2
 """
 
@@ -94,11 +95,42 @@ def plot_and_save_roc_curve(fpr, tpr, roc_auc_val, output_path):
     plt.close()
 
 
+def predict_loader(model, loader, device, tta=False):
+    """Runs inference across a dataloader with optional Test-Time Augmentation (TTA)."""
+    all_targets = []
+    all_probs = []
+
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(batch, (list, tuple)):
+                images, targets = batch[0], batch[1]
+            else:
+                images, targets = batch['image'], batch['label']
+
+            images = images.to(device)
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            if tta:
+                # Horizontal flip TTA
+                flipped_images = torch.flip(images, dims=[3])
+                logits_flip = model(flipped_images)
+                probs_flip = torch.sigmoid(logits_flip)
+                probs = (probs + probs_flip) / 2.0
+
+            all_targets.extend(targets.cpu().numpy().flatten())
+            all_probs.extend(probs.cpu().numpy().flatten())
+
+    return np.array(all_targets).astype(int), np.array(all_probs)
+
+
 def evaluate():
     parser = argparse.ArgumentParser(description="Evaluate DenseNet121 Model on Held-out test.csv")
     parser.add_argument("--test_csv", type=str,
                         default="/content/drive/MyDrive/Pneumonia_Project/metadata/test.csv",
                         help="Path to test.csv metadata")
+    parser.add_argument("--val_csv", type=str, default=None,
+                        help="Optional val.csv path to calibrate optimal classification threshold")
     parser.add_argument("--img_dir", type=str,
                         default="/content/rsna_train_images/stage_2_train_images/",
                         help="Directory containing test images")
@@ -109,11 +141,18 @@ def evaluate():
                         default="/content/drive/MyDrive/Pneumonia_Project/results",
                         help="Directory on Drive to save evaluation figures and JSON")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Probability classification threshold")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Default probability threshold")
+    parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (horizontal flip)")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Member 2 Evaluation] Device: {device}")
+    # Device selection
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"[Member 2 Evaluation] Device: {device} | TTA: {args.tta}")
 
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -132,35 +171,38 @@ def evaluate():
     model.load_state_dict(state_dict)
     model.eval()
 
-    # 2. Test Dataset & DataLoader
     test_transform = get_test_transforms()
+
+    # 2. Threshold Calibration on Validation Set (if provided)
+    chosen_threshold = args.threshold
+    if args.val_csv and os.path.exists(args.val_csv):
+        print(f"Calibrating decision threshold on validation set: {args.val_csv} ...")
+        val_dataset = PneumoniaDataset(args.val_csv, args.img_dir, transform=test_transform)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        val_targets, val_probs = predict_loader(model, val_loader, device, tta=args.tta)
+
+        best_val_acc = 0.0
+        best_th = 0.5
+        # Search thresholds to maximize validation accuracy
+        for th in np.linspace(0.25, 0.75, 101):
+            preds = (val_probs >= th).astype(int)
+            acc_th = (preds == val_targets).mean()
+            if acc_th > best_val_acc:
+                best_val_acc = acc_th
+                best_th = float(th)
+
+        chosen_threshold = best_th
+        print(f"  >>> Optimal Threshold found on validation set: {chosen_threshold:.4f} (Val Accuracy: {best_val_acc * 100:.2f}%)")
+
+    # 3. Test Dataset & DataLoader
     test_dataset = PneumoniaDataset(args.test_csv, args.img_dir, transform=test_transform)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-    print(f"Test set contains {len(test_dataset)} patient cases.")
+    print(f"Running inference across held-out test set ({len(test_dataset)} cases)...")
 
-    all_targets = []
-    all_probs = []
+    all_targets, all_probs = predict_loader(model, test_loader, device, tta=args.tta)
+    all_preds = (all_probs >= chosen_threshold).astype(int)
 
-    print("Running inference across held-out test set...")
-    with torch.no_grad():
-        for batch in test_loader:
-            if isinstance(batch, (list, tuple)):
-                images, targets = batch[0], batch[1]
-            else:
-                images, targets = batch['image'], batch['label']
-
-            images = images.to(device)
-            logits = model(images)
-            probs = torch.sigmoid(logits)
-
-            all_targets.extend(targets.numpy().flatten())
-            all_probs.extend(probs.cpu().numpy().flatten())
-
-    all_targets = np.array(all_targets).astype(int)
-    all_probs = np.array(all_probs)
-    all_preds = (all_probs >= args.threshold).astype(int)
-
-    # 3. Compute Metrics
+    # 4. Compute Metrics
     acc = accuracy_score(all_targets, all_preds)
     prec = precision_score(all_targets, all_preds, zero_division=0)
     rec = recall_score(all_targets, all_preds, zero_division=0)
@@ -175,10 +217,12 @@ def evaluate():
         "recall": float(rec),
         "f1_score": float(f1),
         "roc_auc": float(roc_auc_val),
+        "threshold_used": float(chosen_threshold),
+        "tta_used": bool(args.tta),
         "confusion_matrix": cm.tolist()
     }
 
-    # 4. Save Artifacts to Google Drive
+    # 5. Save Artifacts to Google Drive
     metrics_file = os.path.join(args.results_dir, "test_metrics.json")
     with open(metrics_file, "w") as f:
         json.dump(metrics, f, indent=4)
@@ -189,19 +233,21 @@ def evaluate():
     roc_file = os.path.join(args.results_dir, "roc_curve.png")
     plot_and_save_roc_curve(fpr, tpr, roc_auc_val, roc_file)
 
-    # 5. Output Summary Table
-    print("\n" + "="*48)
-    print("         FINAL HELD-OUT TEST METRICS")
-    print("="*48)
-    print(f"  Accuracy:         {acc:.4f}")
+    # 6. Output Summary Table
+    print("\n" + "="*50)
+    print("       FINAL HELD-OUT TEST EVALUATION RESULTS")
+    print("="*50)
+    print(f"  Accuracy:         {acc * 100:.2f}% ({acc:.4f})")
+    print(f"  ROC-AUC:          {roc_auc_val:.4f}")
     print(f"  Precision:        {prec:.4f}")
     print(f"  Recall:           {rec:.4f}")
     print(f"  F1-Score:         {f1:.4f}")
-    print(f"  ROC-AUC:          {roc_auc_val:.4f}")
-    print("-" * 48)
+    print(f"  Decision Thresh:  {chosen_threshold:.4f}")
+    print(f"  TTA Enabled:      {args.tta}")
+    print("-" * 50)
     print("Confusion Matrix [[TN, FP], [FN, TP]]:")
     print(cm)
-    print("="*48)
+    print("="*50)
     print(f"Artifacts exported to Google Drive ({args.results_dir}):")
     print(f"  -> {metrics_file}")
     print(f"  -> {cm_file}")
