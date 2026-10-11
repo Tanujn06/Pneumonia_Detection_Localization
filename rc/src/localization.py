@@ -375,7 +375,7 @@ def evaluate():
     parser.add_argument("--results_dir", type=str, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--configs", type=str, nargs="+", default=DEFAULT_CONFIGS,
                         help="Configs '<layer>[+tta][+prior][+split]' to compare")
-    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
                         help="Heatmap thresholds to sweep")
     parser.add_argument("--use_val_selection", type=str, default="",
                         help="Path to localization_val_summary.json: evaluate only the val-selected "
@@ -393,7 +393,7 @@ def evaluate():
         with open(args.use_val_selection) as f:
             val_report = json.load(f)
         best = val_report["best"]
-        base = val_report["baseline"]
+        base = val_report.get("baseline") or best
         settings = [(best["config"], best["threshold"])]
         if (base["config"], base["threshold"]) != settings[0]:
             settings.append((base["config"], base["threshold"]))
@@ -449,12 +449,13 @@ def evaluate():
             cam, boxes = localize(cams, config, threshold, prior, args.min_area_frac, args.max_boxes)
             s = score_image(boxes, gt_boxes, cam.shape)
             s["pointing_hit"] = int(pointing_hit(cam, gt_boxes))
+            s["detected"] = int(prob >= 0.5)
             rows[(config, threshold)].append(s)
             per_patient.append({"patientId": pid, "prob": prob, "config": config, "threshold": threshold, **s})
 
         if baseline_boxes:
             reference_rows["median box per lung (train)"].append(
-                score_image(scale_boxes(baseline_boxes, size / 1024, size / 1024), gt_boxes, (size, size)))
+                score_image(scale_boxes(baseline_boxes, size / w, size / h), gt_boxes, (size, size)))
         if prior is not None:
             reference_rows["location prior only (train)"].append(
                 score_image(cam_to_boxes(prior, 0.5, args.min_area_frac, args.max_boxes, True), gt_boxes, (size, size)))
@@ -481,6 +482,13 @@ def evaluate():
     references = {name: summarize(r) for name, r in reference_rows.items() if r}
     probs = np.array(probs)
 
+    def with_detected(setting):
+        """Metrics on all positives, plus on those the classifier detects (p >= 0.5)."""
+        out = summarize(rows[setting])
+        detected = [r for r in rows[setting] if r["detected"]]
+        out["on_classifier_detected"] = summarize(detected) if detected else None
+        return out
+
     report = {
         "split": split_name,
         "checkpoint": args.checkpoint,
@@ -505,8 +513,8 @@ def evaluate():
             "mean_prob": float(probs.mean()),
             "sensitivity@0.5": float((probs >= 0.5).mean()),
         },
-        "best": {**best, **summarize(rows[(best["config"], best["threshold"])])},
-        "baseline": ({**baseline, **summarize(rows[(baseline["config"], baseline["threshold"])])}
+        "best": {**best, **with_detected((best["config"], best["threshold"]))},
+        "baseline": ({**baseline, **with_detected((baseline["config"], baseline["threshold"]))}
                      if baseline else None),
         "image_free_references": references,
     }
@@ -549,6 +557,9 @@ def evaluate():
     print(f"  {chosen}: {best['config']} @ threshold {best['threshold']}")
     if baseline:
         print(f"  Original method:  {baseline['config']} @ threshold {baseline['threshold']}")
+    detected = report["best"]["on_classifier_detected"]
+    if detected:
+        print(line(f"selected, only p>=0.5 ({detected['n_images']} pts)", detected))
     print("=" * 92)
     print(f"Artifacts saved to {args.results_dir}:")
     for p in [summary_path, table_path, per_patient_path, sweep_path, examples_path]:
