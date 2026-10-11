@@ -62,13 +62,13 @@ python rc/src/evaluate.py --test_csv META/test.csv --img_dir IMAGES --checkpoint
 # 3. Grad-CAM for a single image                        (Member 3)
 python rc/src/gradcam.py --image IMAGES/<patientId>.dcm --checkpoint CKPT_DIR/best_model.pth --output gradcam.png
 
-# 4. Localization: pick the heatmap threshold on val, then run test once with that threshold
+# 4. Localization: compare methods/thresholds on val, then run test once with the val-selected setting
 python rc/src/localization.py --split_csv META/val.csv  --annotations_csv META/all_annotations.csv \
     --train_csv META/train.csv --img_dir IMAGES --checkpoint CKPT_DIR/best_model.pth \
-    --results_dir RESULTS/localization --thresholds 0.3 0.4 0.5 0.6 0.7
+    --results_dir RESULTS/localization
 python rc/src/localization.py --split_csv META/test.csv --annotations_csv META/all_annotations.csv \
     --train_csv META/train.csv --img_dir IMAGES --checkpoint CKPT_DIR/best_model.pth \
-    --results_dir RESULTS/localization --thresholds <best threshold from val>
+    --results_dir RESULTS/localization --use_val_selection RESULTS/localization/localization_val_summary.json
 
 # 5. Demo
 streamlit run rc/app/app.py
@@ -76,37 +76,47 @@ streamlit run rc/app/app.py
 
 To run the Streamlit app in Colab, use Step 9 of `rc/notebooks/Member_3_Localization_and_Demo.ipynb`. It
 starts the app and opens a public `trycloudflare.com` link. The app reads its default settings from these
-environment variables: `PNEUMONIA_CHECKPOINT`, `PNEUMONIA_ANNOTATIONS`, and `PNEUMONIA_CAM_THRESHOLD`.
+environment variables: `PNEUMONIA_CHECKPOINT`, `PNEUMONIA_ANNOTATIONS`, `PNEUMONIA_CAM_THRESHOLD`, and
+`PNEUMONIA_LOC_CONFIG` (for example `denseblock3+tta+prior+split`).
 
 ## Localization method (Member 3)
 
-1. **Grad-CAM.** The target layer is DenseNet121's last feature map (`features.norm5` followed by ReLU; 7×7
-   for a 224×224 input). Each channel is weighted by the spatial mean of the pneumonia logit's gradient. The
-   weighted sum goes through a ReLU, is upsampled to the original 1024×1024 image, and is scaled to [0, 1].
-   Preprocessing is identical to validation and test: DICOM → `read_xray` → resize to 224 → ImageNet normalization.
+1. **Grad-CAM.** Each channel of a DenseNet121 feature map is weighted by the spatial mean of the pneumonia
+   logit's gradient. The weighted sum goes through a ReLU, is upsampled to the original 1024×1024 image, and is
+   scaled to [0, 1]. Preprocessing is identical to validation and test: DICOM → `read_xray` → resize to 224 →
+   ImageNet normalization. Two target layers are supported: `norm5` (the last feature map, 7×7, the original
+   method) and `denseblock3` (14×14, finer).
 2. **Boxes.** The heatmap is thresholded at a fraction of its maximum and split into 8-connected regions.
    Regions smaller than 1% of the image are dropped. The 3 regions with the largest total activation are
    kept, and each one is reported as an `x, y, width, height` box (the RSNA format).
-3. **Evaluation** uses every ground-truth-positive patient in the split, whatever the classifier predicted:
+3. **Optional improvements**, combined into a configuration string such as `denseblock3+tta+prior+split`:
+   - `tta`: average the heatmap with the heatmap of the horizontally mirrored image.
+   - `prior`: multiply the heatmap by a map of where pneumonia boxes occur in the **train** split. This
+     down-weights regions such as the shoulders or the image border.
+   - `split`: cut the mask at the vertical midline so each lung gets its own box. 54% of positive RSNA
+     patients have two boxes, one per lung.
+4. **Evaluation** uses every ground-truth-positive patient in the split, whatever the classifier predicted:
    - **Mask IoU:** IoU between the union of the predicted boxes and the union of the ground-truth boxes,
      averaged over images.
    - **Mean best IoU per ground-truth box:** for each ground-truth box, the highest IoU of any predicted box.
    - **Recall and precision at IoU ≥ 0.3 and 0.5:** predicted and ground-truth boxes are matched one to one
      with the Hungarian algorithm.
    - **Pointing game:** whether the heatmap's peak falls inside a ground-truth box.
-   - **Prior-box baseline:** one fixed median box per lung, computed from the training-set ground truth.
-     The heatmap boxes are only useful if they beat this baseline.
-4. **Protocol.** The threshold is chosen on `val.csv` by the best mean mask IoU. `test.csv` is evaluated
-   once, with that threshold.
+   - **References that use no model:** one fixed median box per lung, and the train location map on its own.
+     The heatmap boxes are only useful if they beat these.
+   - **Coordinate check:** image sizes and the number of ground-truth boxes that fall outside the image.
+5. **Protocol.** Every configuration and threshold is compared on `val.csv`, and the setting with the best mean
+   mask IoU is selected. `test.csv` is evaluated once with that setting, alongside the original `norm5` method.
 
 Outputs are written to `Pneumonia_Project/results/localization/`:
 
 | File | Contents |
 |---|---|
-| `localization_<split>_summary.json` | Aggregate metrics for each threshold, the baseline, and the selected threshold |
+| `localization_<split>_summary.json` | Selected setting, original method, references that use no model, coordinate check |
+| `localization_<split>_comparison.csv` | Metrics for every configuration and threshold |
 | `localization_<split>_per_patient.csv` | Metrics for each image |
-| `localization_<split>_threshold_sweep.png` | IoU and recall against the heatmap threshold |
-| `localization_<split>_examples.png` | Heatmaps with ground-truth (green) and predicted (red) boxes |
+| `localization_<split>_threshold_sweep.png` | Mean mask IoU against threshold for each configuration |
+| `localization_<split>_examples.png` | Original and selected method on the same patients, with ground-truth (green) and predicted (red) boxes |
 
 ## Team
 

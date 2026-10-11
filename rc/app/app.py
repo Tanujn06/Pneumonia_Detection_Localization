@@ -22,8 +22,9 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from gradcam import load_model, load_image, explain, overlay_heatmap, DEFAULT_CHECKPOINT  # noqa: E402
-from localization import cam_to_boxes, load_gt_boxes, mask_iou, draw_boxes, DEFAULT_METADATA_DIR  # noqa: E402
+from gradcam import load_model, load_image, explain_multi, overlay_heatmap, DEFAULT_CHECKPOINT, TARGET_LAYERS  # noqa: E402
+from localization import (localize, location_prior, parse_config, load_gt_boxes, mask_iou,  # noqa: E402
+                          draw_boxes, BASELINE_CONFIG, DEFAULT_METADATA_DIR)
 
 
 st.set_page_config(page_title="Pneumonia Detection & Localization", layout="wide")
@@ -38,6 +39,12 @@ def get_model(checkpoint_path):
 @st.cache_data
 def get_annotations(annotations_csv):
     return load_gt_boxes(annotations_csv)
+
+
+@st.cache_data
+def get_prior(annotations_csv, train_csv):
+    """Train-split location prior (needs all_annotations.csv and train.csv)."""
+    return location_prior(pd.read_csv(train_csv)["patientId"], load_gt_boxes(annotations_csv))
 
 
 def read_upload(uploaded):
@@ -70,6 +77,18 @@ with st.sidebar:
                               float(os.environ.get("PNEUMONIA_CAM_THRESHOLD", 0.5)), 0.05,
                               help="Fraction of the heatmap maximum. Tuned on val.csv by localization.py.")
     max_boxes = st.slider("Max boxes", 1, 4, 3)
+
+    st.subheader("Localization method")
+    default = parse_config(os.environ.get("PNEUMONIA_LOC_CONFIG", BASELINE_CONFIG))
+    layer = st.selectbox("Grad-CAM layer", TARGET_LAYERS, index=TARGET_LAYERS.index(default["layer"]),
+                         help="norm5 = 7x7 heatmap, denseblock3 = 14x14 (finer)")
+    use_tta = st.checkbox("Flip test-time augmentation", default["tta"])
+    use_split = st.checkbox("One box per lung (split at midline)", default["split"])
+    train_csv = str(Path(annotations_csv).with_name("train.csv")) if annotations_csv else ""
+    prior_available = bool(train_csv) and os.path.exists(train_csv) and os.path.exists(annotations_csv)
+    use_prior = st.checkbox("Location prior (from train boxes)", default["prior"] and prior_available,
+                            disabled=not prior_available,
+                            help="Needs train.csv next to all_annotations.csv")
     alpha = st.slider("Heatmap opacity", 0.0, 1.0, 0.4, 0.05)
 
 try:
@@ -85,8 +104,10 @@ if uploaded is None:
 
 with st.spinner("Running model and Grad-CAM..."):
     image = read_upload(uploaded)
-    cam, prob = explain(model, image, device)
-    boxes = cam_to_boxes(cam, cam_threshold, max_boxes=max_boxes)
+    config = "+".join([layer] + [o for o, on in (("tta", use_tta), ("prior", use_prior), ("split", use_split)) if on])
+    cams, prob = explain_multi(model, image, device, (layer,), use_tta)
+    prior = get_prior(annotations_csv, train_csv) if use_prior else None
+    cam, boxes = localize(cams, config, cam_threshold, prior, max_boxes=max_boxes)
 
 patient_id = Path(uploaded.name).stem
 gt_boxes = []
@@ -99,7 +120,8 @@ col_metric.metric("P(pneumonia)", f"{prob:.1%}")
 col_info.markdown(
     f"**Model output:** {'Pneumonia suspected' if is_positive else 'No pneumonia detected'} "
     f"(threshold {decision_threshold:.2f})  \n"
-    f"**Image:** `{uploaded.name}` — {image.size[0]}×{image.size[1]} px"
+    f"**Image:** `{uploaded.name}` — {image.size[0]}×{image.size[1]} px  \n"
+    f"**Localization:** `{config}`, heatmap threshold {cam_threshold:.2f}"
 )
 
 col1, col2, col3 = st.columns(3)
