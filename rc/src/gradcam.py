@@ -34,7 +34,7 @@ except ImportError:
     from src.dataset import read_xray, IMAGE_SIZE, MEAN, STD
 
 
-DEFAULT_CHECKPOINT = "/content/drive/MyDrive/Pneumonia_Project/checkpoints/best_model.pth"
+DEFAULT_CHECKPOINT = "/content/drive/MyDrive/Pneumonia_Project/checkpoint1/best_model.pth"
 
 
 def get_eval_transform():
