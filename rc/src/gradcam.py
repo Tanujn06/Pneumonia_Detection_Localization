@@ -1,7 +1,7 @@
 """
 gradcam.py - Grad-CAM heatmaps for the DenseNet121 pneumonia classifier
-Loads Member 2's checkpoint and explains the single pneumonia logit using the
-last convolutional feature map of DenseNet121 (densenet.features -> norm5, 7x7 at 224px).
+Loads Member 2's checkpoint and explains the single pneumonia logit using a
+DenseNet121 feature map: norm5 (last, 7x7 at 224px) or denseblock3 (14x14).
 Author: Member 3
 """
 
