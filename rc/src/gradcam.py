@@ -73,6 +73,12 @@ def load_image(image_path):
     return Image.open(image_path).convert("RGB")
 
 
+# Layers Grad-CAM can target. Resolution is for a 224x224 input.
+#   norm5       : last feature map (after ReLU), 7x7   -> one cell ~146 px of a 1024 px X-ray
+#   denseblock3 : output of the third dense block, 14x14 -> one cell ~73 px
+TARGET_LAYERS = ("norm5", "denseblock3")
+
+
 class GradCAM:
     """
     Grad-CAM (Selvaraju et al., 2017) for PneumoniaDenseNet121.
@@ -83,48 +89,90 @@ class GradCAM:
         features -> ReLU -> global average pool -> classifier
     """
 
-    def __init__(self, model):
+    def __init__(self, model, target_layers=("norm5",)):
+        unknown = set(target_layers) - set(TARGET_LAYERS)
+        if unknown:
+            raise ValueError(f"Unsupported target layer(s) {unknown}; choose from {TARGET_LAYERS}")
         self.model = model
         self.densenet = model.densenet
+        self.target_layers = tuple(target_layers)
 
-    def __call__(self, input_tensor):
+    def compute(self, input_tensor):
         """
         Args:
             input_tensor: normalized image batch of shape (1, 3, H, W).
         Returns:
-            cam: np.ndarray (H, W) in [0, 1], upsampled to the input size.
+            cams: {layer: np.ndarray (H, W) in [0, 1], upsampled to the input size}
             prob: predicted pneumonia probability (float).
         """
         self.model.eval()
         x = input_tensor
 
         with torch.enable_grad():
-            activations = F.relu(self.densenet.features(x))
-            pooled = F.adaptive_avg_pool2d(activations, (1, 1)).flatten(1)
+            captured = {}
+            h = x
+            for name, module in self.densenet.features.named_children():
+                h = module(h)
+                if name == "norm5":
+                    h = F.relu(h)
+                if name in self.target_layers:
+                    captured[name] = h
+            pooled = F.adaptive_avg_pool2d(h, (1, 1)).flatten(1)
             logit = self.densenet.classifier(pooled)
-            grads = torch.autograd.grad(logit.sum(), activations)[0]
+            names = list(captured)
+            grads = torch.autograd.grad(logit.sum(), [captured[n] for n in names])
 
-        # Channel weights = global-average-pooled gradients of the pneumonia logit.
-        weights = grads.mean(dim=(2, 3), keepdim=True)
-        cam = F.relu((weights * activations).sum(dim=1, keepdim=True))
-        cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        cam = cam[0, 0].detach().cpu().numpy()
-
-        cam -= cam.min()
-        if cam.max() > 0:
-            cam /= cam.max()
+        cams = {}
+        for name, grad in zip(names, grads):
+            activations = captured[name]
+            # Channel weights = global-average-pooled gradients of the pneumonia logit.
+            weights = grad.mean(dim=(2, 3), keepdim=True)
+            cam = F.relu((weights * activations).sum(dim=1, keepdim=True))
+            cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            cam = cam[0, 0].detach().cpu().numpy()
+            cam -= cam.min()
+            if cam.max() > 0:
+                cam /= cam.max()
+            cams[name] = cam.astype(np.float32)
 
         prob = torch.sigmoid(logit).item()
-        return cam.astype(np.float32), prob
+        return cams, prob
+
+    def __call__(self, input_tensor):
+        """Heatmap for the first target layer: returns (cam, prob)."""
+        cams, prob = self.compute(input_tensor)
+        return cams[self.target_layers[0]], prob
 
 
-def explain(model, pil_image, device=None):
-    """Run preprocessing + Grad-CAM on a PIL image; returns (cam at original size, probability)."""
+def explain_multi(model, pil_image, device=None, target_layers=("norm5",), flip_tta=False):
+    """
+    Grad-CAM for several layers in one pass.
+    flip_tta also explains the horizontally mirrored image (train.py trains with
+    RandomHorizontalFlip), mirrors that heatmap back and averages the two.
+
+    Returns ({(layer, flip_tta): cam at original size}, probability). When flip_tta
+    is True both the plain and the averaged heatmaps are returned. The probability
+    is always for the unflipped image, matching evaluate.py.
+    """
     device = device or next(model.parameters()).device
     tensor = get_eval_transform()(pil_image).unsqueeze(0).to(device)
-    cam, prob = GradCAM(model)(tensor)
-    cam = resize_cam(cam, pil_image.size)
-    return cam, prob
+    gradcam = GradCAM(model, target_layers)
+    cams, prob = gradcam.compute(tensor)
+    out = {(layer, False): cam for layer, cam in cams.items()}
+
+    if flip_tta:
+        flipped, _ = gradcam.compute(torch.flip(tensor, dims=[3]))
+        for layer, cam in cams.items():
+            avg = (cam + flipped[layer][:, ::-1]) / 2
+            out[(layer, True)] = avg / avg.max() if avg.max() > 0 else avg
+
+    return {k: resize_cam(v, pil_image.size) for k, v in out.items()}, prob
+
+
+def explain(model, pil_image, device=None, target_layer="norm5", flip_tta=False):
+    """Run preprocessing + Grad-CAM on a PIL image; returns (cam at original size, probability)."""
+    cams, prob = explain_multi(model, pil_image, device, (target_layer,), flip_tta)
+    return cams[(target_layer, flip_tta)], prob
 
 
 def resize_cam(cam, size):
@@ -150,6 +198,8 @@ def main():
                         help="Path to best_model.pth")
     parser.add_argument("--output", type=str, default="gradcam_output.png",
                         help="Where to save the overlay figure")
+    parser.add_argument("--target_layer", type=str, default="norm5", choices=TARGET_LAYERS)
+    parser.add_argument("--flip_tta", action="store_true", help="Average with the mirrored image's heatmap")
     args = parser.parse_args()
 
     import matplotlib
@@ -159,7 +209,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
     image = load_image(args.image)
-    cam, prob = explain(model, image, device)
+    cam, prob = explain(model, image, device, args.target_layer, args.flip_tta)
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     axes[0].imshow(image, cmap="gray")
