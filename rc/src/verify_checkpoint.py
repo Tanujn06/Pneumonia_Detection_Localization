@@ -33,7 +33,10 @@ def verify(checkpoint_path):
     print(f"File Path: {checkpoint_path}")
     print(f"File Size: {os.path.getsize(checkpoint_path) / (1024*1024):.2f} MB")
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
 
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
         epoch = ckpt.get('epoch', 'Unknown')

@@ -122,7 +122,10 @@ def evaluate():
         raise FileNotFoundError(f"Checkpoint not found at: {args.checkpoint}")
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    try:
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(args.checkpoint, map_location=device)
     model = get_model(pretrained=False).to(device)
 
     state_dict = checkpoint['model_state_dict'] if (isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint) else checkpoint
