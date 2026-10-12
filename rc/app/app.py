@@ -1,280 +1,119 @@
 
-import os
 import sys
-import tempfile
 from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog
 
-import streamlit as st
-import numpy as np
-import cv2
 import torch
 import matplotlib.pyplot as plt
-from PIL import Image
+import numpy as np
 
 # --------------------------------------------------
-# Project paths and imports
+# Project paths
 # --------------------------------------------------
-RC_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = RC_DIR / "src"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
 
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(SRC_DIR))
 
 from gradcam import load_model, load_image, explain, overlay_heatmap
 
-DEFAULT_CHECKPOINT = os.environ.get(
-    "PNEUMONIA_CHECKPOINT",
-    "/content/drive/MyDrive/Pneumonia_Project/checkpoint1/best_model.pth",
+# Change this to the location of your downloaded checkpoint.
+CHECKPOINT = Path(
+    r"C:\Pneumonia_Project\checkpoint1\best_model.pth"
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --------------------------------------------------
-# Streamlit page
-# --------------------------------------------------
-st.set_page_config(
-    page_title="Pneumonia Detection & Localization",
-    page_icon="🫁",
-    layout="wide",
-)
 
-st.title("🫁 Pneumonia Detection & Localization")
-st.write(
-    "Upload a chest X-ray to obtain a pneumonia classification "
-    "and a Grad-CAM-based visual explanation."
-)
+def main():
+    print("=" * 55)
+    print("PNEUMONIA DETECTION AND LOCALIZATION")
+    print("=" * 55)
 
-st.info(
-    "This is an academic demonstration. Predictions and highlighted "
-    "regions are not a substitute for professional medical diagnosis."
-)
+    if not CHECKPOINT.exists():
+        print(f"\nCheckpoint not found:\n{CHECKPOINT}")
+        print("Download best_model.pth from Google Drive and update CHECKPOINT.")
+        return
 
-# --------------------------------------------------
-# Sidebar settings
-# --------------------------------------------------
-st.sidebar.header("Model settings")
+    # Upload/select a chest X-ray
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
 
-checkpoint_path = st.sidebar.text_input(
-    "Trained checkpoint path",
-    value=DEFAULT_CHECKPOINT,
-)
-
-target_layer = st.sidebar.selectbox(
-    "Grad-CAM layer",
-    options=["norm5", "denseblock3"],
-    index=0,
-)
-
-flip_tta = st.sidebar.checkbox(
-    "Use horizontal-flip TTA for heatmap",
-    value=True,
-)
-
-heatmap_threshold = st.sidebar.slider(
-    "Localization threshold",
-    min_value=0.1,
-    max_value=0.9,
-    value=0.6,
-    step=0.05,
-)
-
-st.sidebar.caption(f"Device: {DEVICE}")
-
-# --------------------------------------------------
-# Load trained model
-# --------------------------------------------------
-@st.cache_resource
-def get_model(path, device_name):
-    return load_model(path, torch.device(device_name))
-
-
-# --------------------------------------------------
-# Convert heatmap into approximate bounding boxes
-# --------------------------------------------------
-def heatmap_to_boxes(cam, threshold=0.6, min_area_frac=0.01, max_boxes=3):
-    """
-    Generate approximate boxes from a normalized Grad-CAM heatmap.
-    These are not boxes directly predicted by a detector.
-    """
-    cam = np.asarray(cam, dtype=np.float32)
-
-    if cam.size == 0 or float(cam.max()) <= 0:
-        return []
-
-    mask = (cam >= threshold * cam.max()).astype(np.uint8)
-
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
+    image_path = filedialog.askopenfilename(
+        title="Select a chest X-ray",
+        filetypes=[
+            ("Chest X-ray images", "*.png *.jpg *.jpeg *.dcm"),
+            ("All files", "*.*"),
+        ],
     )
+    root.destroy()
 
-    min_area = min_area_frac * cam.shape[0] * cam.shape[1]
-    boxes = []
-
-    for i in range(1, count):
-        x, y, w, h, area = stats[i]
-
-        if area < min_area:
-            continue
-
-        boxes.append({
-            "box": (int(x), int(y), int(x + w), int(y + h)),
-            "area": int(area),
-            "activation": float(cam[labels == i].mean()),
-        })
-
-    boxes.sort(key=lambda item: item["activation"], reverse=True)
-    return boxes[:max_boxes]
-
-
-def draw_boxes(image, boxes):
-    result = np.asarray(image.convert("RGB")).copy()
-
-    for item in boxes:
-        x1, y1, x2, y2 = item["box"]
-        cv2.rectangle(result, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-    return result
-
-
-# --------------------------------------------------
-# Upload image
-# --------------------------------------------------
-uploaded = st.file_uploader(
-    "Upload a chest X-ray",
-    type=["png", "jpg", "jpeg", "dcm"],
-    help="Supported formats: PNG, JPG, JPEG and DICOM (.dcm).",
-)
-
-if uploaded is not None:
-    st.subheader("Input image")
-
-    # gradcam.load_image supports DICOM and ordinary image files.
-    suffix = Path(uploaded.name).suffix.lower()
-
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
-        temp.write(uploaded.getvalue())
-        temp_path = temp.name
+    if not image_path:
+        print("No image selected.")
+        return
 
     try:
-        image = load_image(temp_path)
+        print("\nLoading trained model...")
+        model = load_model(str(CHECKPOINT), DEVICE)
 
-        left, right = st.columns([1, 1])
+        print("Loading X-ray...")
+        image = load_image(image_path)
 
-        with left:
-            st.image(image, caption="Uploaded chest X-ray", width="stretch")
+        print("Generating prediction and Grad-CAM...")
+        cam, probability = explain(
+            model,
+            image,
+            device=DEVICE,
+            target_layer="norm5",
+            flip_tta=True,
+        )
 
-        if st.button("Analyze X-ray", type="primary", use_container_width=True):
-            if not Path(checkpoint_path).is_file():
-                st.error(
-                    "Checkpoint not found. Enter the correct path in the "
-                    "sidebar and try again."
-                )
-            else:
-                try:
-                    with st.spinner("Loading model and generating explanation..."):
-                        model = get_model(checkpoint_path, str(DEVICE))
+        overlay = overlay_heatmap(image, cam, alpha=0.4)
 
-                        cam, probability = explain(
-                            model,
-                            image,
-                            DEVICE,
-                            target_layer=target_layer,
-                            flip_tta=flip_tta,
-                        )
+        # Classification result
+        print("\n" + "=" * 55)
+        print("CLASSIFICATION RESULT")
+        print("=" * 55)
+        print(f"Pneumonia probability:    {probability * 100:.2f}%")
+        print(f"No-pneumonia probability: {(1-probability) * 100:.2f}%")
+        print(
+            "Prediction:",
+            "Pneumonia-positive" if probability >= 0.5
+            else "Pneumonia-negative",
+        )
+        print("=" * 55)
 
-                        heatmap_overlay = overlay_heatmap(
-                            image, cam, alpha=0.4
-                        )
+        # Show original X-ray and heatmap
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-                        boxes = heatmap_to_boxes(
-                            cam, threshold=heatmap_threshold
-                        )
+        axes[0].imshow(image, cmap="gray")
+        axes[0].set_title("Input X-ray")
 
-                        localized_image = draw_boxes(image, boxes)
+        axes[1].imshow(cam, cmap="jet", vmin=0, vmax=1)
+        axes[1].set_title("Grad-CAM Heatmap")
 
-                    st.subheader("Classification result")
+        axes[2].imshow(overlay)
+        axes[2].set_title("Heatmap Overlay")
 
-                    metric1, metric2 = st.columns(2)
+        for ax in axes:
+            ax.axis("off")
 
-                    with metric1:
-                        st.metric(
-                            "Pneumonia probability",
-                            f"{probability * 100:.2f}%",
-                        )
+        plt.tight_layout()
+        plt.show()
 
-                    with metric2:
-                        st.metric(
-                            "No-pneumonia probability",
-                            f"{(1 - probability) * 100:.2f}%",
-                        )
-
-                    if probability >= 0.5:
-                        st.warning(
-                            "Model prediction: Pneumonia-positive"
-                        )
-                    else:
-                        st.success(
-                            "Model prediction: Pneumonia-negative"
-                        )
-
-                    st.subheader("Grad-CAM visualization")
-
-                    c1, c2 = st.columns(2)
-
-                    with c1:
-                        st.image(
-                            heatmap_overlay,
-                            caption="Grad-CAM heatmap overlay",
-                            width="stretch",
-                        )
-
-                    with c2:
-                        st.image(
-                            localized_image,
-                            caption="Approximate localization boxes",
-                            width="stretch",
-                        )
-
-                    st.caption(
-                        "Green boxes are generated from thresholded Grad-CAM "
-                        "activation regions. They are approximate visual "
-                        "localizations, not ground-truth boxes or clinical "
-                        "segmentation."
-                    )
-
-                    if boxes:
-                        st.write("Approximate regions:")
-                        for index, item in enumerate(boxes, start=1):
-                            st.write(
-                                f"Region {index}: {item['box']}"
-                            )
-                    else:
-                        st.info(
-                            "No heatmap region met the current threshold. "
-                            "Try adjusting the localization threshold."
-                        )
-
-                    with st.expander("Technical details"):
-                        st.write(f"Device: {DEVICE}")
-                        st.write(f"Grad-CAM layer: {target_layer}")
-                        st.write(f"Flip TTA: {flip_tta}")
-                        st.write(f"Heatmap threshold: {heatmap_threshold}")
-
-                except Exception as exc:
-                    st.error(f"Analysis failed: {exc}")
-                    st.exception(exc)
+        # Save output alongside the selected image
+        output_path = Path(image_path).with_name(
+            Path(image_path).stem + "_gradcam.png"
+        )
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"\nVisualization saved to: {output_path}")
 
     except Exception as exc:
-        st.error(f"Could not read the uploaded X-ray: {exc}")
+        print(f"\nAnalysis failed: {exc}")
+        raise
 
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
 
-st.divider()
-st.caption(
-    "Deep Learning Pneumonia Detection & Localization | "
-    "DenseNet121 + Grad-CAM | Academic prototype"
-)
+if __name__ == "__main__":
+    main()
