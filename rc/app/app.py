@@ -1,119 +1,180 @@
 
-import sys
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog
+import sys
 
 import torch
 import matplotlib.pyplot as plt
-import numpy as np
 
-# --------------------------------------------------
-# Project paths
-# --------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
+from google.colab import files
+from IPython.display import display
 
-sys.path.insert(0, str(SRC_DIR))
+# ============================================================
+# 1. PROJECT PATHS
+# ============================================================
 
-from gradcam import load_model, load_image, explain, overlay_heatmap
-
-# Change this to the location of your downloaded checkpoint.
-CHECKPOINT = Path(
-    "/content/drive/MyDrive/Pneumonia_Project/checkpoint1/best_model.pth"
+PROJECT = Path(
+    "/content/Pneumonia_Detection_Localization/"
+    "Pneumonia_Detection_Localization"
 )
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SRC = PROJECT / "rc" / "src"
 
+CHECKPOINT = Path(
+    "/content/drive/MyDrive/Pneumonia_Project/"
+    "checkpoint1/best_model.pth"
+)
+
+if not SRC.exists():
+    raise FileNotFoundError(f"Source directory not found: {SRC}")
+
+if not CHECKPOINT.exists():
+    raise FileNotFoundError(
+        f"Checkpoint not found: {CHECKPOINT}\n"
+        "Check that Google Drive is mounted and the path is correct."
+    )
+
+sys.path.insert(0, str(SRC))
+
+from gradcam import (
+    load_model,
+    load_image,
+    explain,
+    overlay_heatmap,
+)
+
+
+# ============================================================
+# 2. MAIN APPLICATION
+# ============================================================
 
 def main():
     print("=" * 55)
     print("PNEUMONIA DETECTION AND LOCALIZATION")
     print("=" * 55)
 
-    if not CHECKPOINT.exists():
-        print(f"\nCheckpoint not found:\n{CHECKPOINT}")
-        print("Download best_model.pth from Google Drive and update CHECKPOINT.")
-        return
-
-    # Upload/select a chest X-ray
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-
-    image_path = filedialog.askopenfilename(
-        title="Select a chest X-ray",
-        filetypes=[
-            ("Chest X-ray images", "*.png *.jpg *.jpeg *.dcm"),
-            ("All files", "*.*"),
-        ],
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
-    root.destroy()
 
-    if not image_path:
-        print("No image selected.")
+    print(f"\nDevice: {device}")
+    print("Loading trained model...")
+
+    model = load_model(str(CHECKPOINT), device)
+
+    print("Model loaded successfully!")
+
+    # --------------------------------------------------------
+    # 3. UPLOAD CHEST X-RAY
+    # --------------------------------------------------------
+
+    print("\nUpload a chest X-ray image.")
+    print("Supported formats: PNG, JPG, JPEG, DCM")
+
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("No image uploaded. Please run the cell again.")
         return
 
-    try:
-        print("\nLoading trained model...")
-        model = load_model(str(CHECKPOINT), DEVICE)
+    filename = next(iter(uploaded))
+    image_path = Path("/content") / filename
 
-        print("Loading X-ray...")
-        image = load_image(image_path)
+    print(f"\nUploaded image: {filename}")
 
-        print("Generating prediction and Grad-CAM...")
-        cam, probability = explain(
-            model,
-            image,
-            device=DEVICE,
-            target_layer="norm5",
-            flip_tta=True,
-        )
+    # --------------------------------------------------------
+    # 4. PREDICTION AND GRAD-CAM
+    # --------------------------------------------------------
 
-        overlay = overlay_heatmap(image, cam, alpha=0.4)
+    print("\nProcessing X-ray...")
 
-        # Classification result
-        print("\n" + "=" * 55)
-        print("CLASSIFICATION RESULT")
-        print("=" * 55)
-        print(f"Pneumonia probability:    {probability * 100:.2f}%")
-        print(f"No-pneumonia probability: {(1-probability) * 100:.2f}%")
-        print(
-            "Prediction:",
-            "Pneumonia-positive" if probability >= 0.5
-            else "Pneumonia-negative",
-        )
-        print("=" * 55)
+    image = load_image(str(image_path))
 
-        # Show original X-ray and heatmap
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    cam, probability = explain(
+        model,
+        image,
+        device=device,
+        target_layer="norm5",
+        flip_tta=True,
+    )
 
-        axes[0].imshow(image, cmap="gray")
-        axes[0].set_title("Input X-ray")
+    overlay = overlay_heatmap(
+        image,
+        cam,
+        alpha=0.4,
+    )
 
-        axes[1].imshow(cam, cmap="jet", vmin=0, vmax=1)
-        axes[1].set_title("Grad-CAM Heatmap")
+    probability = float(probability)
 
-        axes[2].imshow(overlay)
-        axes[2].set_title("Heatmap Overlay")
+    # --------------------------------------------------------
+    # 5. DISPLAY CLASSIFICATION RESULT
+    # --------------------------------------------------------
 
-        for ax in axes:
-            ax.axis("off")
+    prediction = (
+        "Pneumonia-positive"
+        if probability >= 0.5
+        else "Pneumonia-negative"
+    )
 
-        plt.tight_layout()
-        plt.show()
+    print("\n" + "=" * 55)
+    print("PNEUMONIA DETECTION RESULT")
+    print("=" * 55)
 
-        # Save output alongside the selected image
-        output_path = Path(image_path).with_name(
-            Path(image_path).stem + "_gradcam.png"
-        )
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
-        print(f"\nVisualization saved to: {output_path}")
+    print(f"Pneumonia probability:     {probability * 100:.2f}%")
+    print(f"No-pneumonia probability: {(1 - probability) * 100:.2f}%")
+    print(f"Predicted class: {prediction}")
+    print("Decision threshold: 0.50")
 
-    except Exception as exc:
-        print(f"\nAnalysis failed: {exc}")
-        raise
+    print("=" * 55)
 
+    # --------------------------------------------------------
+    # 6. DISPLAY GRAD-CAM VISUALIZATION
+    # --------------------------------------------------------
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    axes[0].imshow(image, cmap="gray")
+    axes[0].set_title("Input Chest X-ray")
+
+    axes[1].imshow(cam, cmap="jet", vmin=0, vmax=1)
+    axes[1].set_title("Grad-CAM Heatmap")
+
+    axes[2].imshow(overlay)
+    axes[2].set_title("Grad-CAM Overlay")
+
+    for ax in axes:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    # --------------------------------------------------------
+    # 7. SAVE VISUALIZATION
+    # --------------------------------------------------------
+
+    output_path = Path("/content") / (
+        Path(filename).stem + "_gradcam.png"
+    )
+
+    fig.savefig(
+        output_path,
+        dpi=150,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    print(f"\nVisualization saved to: {output_path}")
+
+    print(
+        "\nNote: Grad-CAM highlights regions influencing the "
+        "model's prediction. It is not a clinically validated "
+        "pneumonia localization method."
+    )
+
+
+# ============================================================
+# 8. EXECUTION
+# ============================================================
 
 if __name__ == "__main__":
     main()
