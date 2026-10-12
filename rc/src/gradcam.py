@@ -1,8 +1,6 @@
 """
-gradcam.py - Grad-CAM heatmaps for the DenseNet121 pneumonia classifier
-Loads Member 2's checkpoint and explains the single pneumonia logit using a
-DenseNet121 feature map: norm5 (last, 7x7 at 224px) or denseblock3 (14x14).
-Author: Member 3
+gradcam.py - Grad-CAM heatmaps for a DenseNet121 pneumonia classifier.
+Assumes model.py exposes get_model() and the wrapper has model.densenet.
 """
 
 import os
@@ -16,12 +14,11 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-# Ensure imports resolve whether executed from root or rc/
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-for p in [current_dir, parent_dir]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(CURRENT_DIR)
+for path in (CURRENT_DIR, PARENT_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 try:
     from model import get_model
@@ -33,12 +30,12 @@ try:
 except ImportError:
     from src.dataset import read_xray, IMAGE_SIZE, MEAN, STD
 
-
-DEFAULT_CHECKPOINT = "/content/drive/MyDrive/Pneumonia_Project/checkpoint1/best_model.pth"
+DEFAULT_CHECKPOINT = "/content/drive/MyDrive/Pneumonia_Project/checkpoints/best_model.pth"
+TARGET_LAYERS = ("norm5", "denseblock3")
 
 
 def get_eval_transform():
-    """Same deterministic preprocessing as validation/test in train.py and evaluate.py."""
+    """Preprocessing must match the preprocessing used during evaluation."""
     return transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
@@ -47,18 +44,21 @@ def get_eval_transform():
 
 
 def load_model(checkpoint_path, device=None):
-    """Load the DenseNet121 classifier from a checkpoint saved by train.py."""
+    """Load a trusted training checkpoint."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(checkpoint_path):
+    if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
 
-    # train.py stores numpy scalars (val_auc) alongside the weights, which the
-    # PyTorch >= 2.6 weights_only loader rejects. The checkpoint is our own file.
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state_dict"] if (
-        isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-    ) else checkpoint
-
+    # weights_only=False supports checkpoints containing NumPy metadata.
+    # Only load checkpoints that you trust.
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
+    )
     model = get_model(pretrained=False).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -66,140 +66,175 @@ def load_model(checkpoint_path, device=None):
 
 
 def load_image(image_path):
-    """Load a DICOM / PNG / JPG X-ray as an RGB PIL image (DICOMs use Member 1's read_xray)."""
+    """Load a DICOM, PNG, or JPG X-ray as an RGB PIL image."""
     image_path = Path(image_path)
     if image_path.suffix.lower() == ".dcm":
         return Image.fromarray(read_xray(image_path)).convert("RGB")
-    return Image.open(image_path).convert("RGB")
-
-
-# Layers Grad-CAM can target. Resolution is for a 224x224 input.
-#   norm5       : last feature map (after ReLU), 7x7   -> one cell ~146 px of a 1024 px X-ray
-#   denseblock3 : output of the third dense block, 14x14 -> one cell ~73 px
-TARGET_LAYERS = ("norm5", "denseblock3")
+    with Image.open(image_path) as source:
+        return source.convert("RGB")
 
 
 class GradCAM:
-    """
-    Grad-CAM (Selvaraju et al., 2017) for PneumoniaDenseNet121.
-
-    Instead of forward/backward hooks, the DenseNet forward pass is replayed
-    explicitly so the activations can be captured without clashing with the
-    in-place ReLU that torchvision applies after the feature extractor:
-        features -> ReLU -> global average pool -> classifier
-    """
+    """Grad-CAM for a single-logit DenseNet pneumonia classifier."""
 
     def __init__(self, model, target_layers=("norm5",)):
         unknown = set(target_layers) - set(TARGET_LAYERS)
         if unknown:
-            raise ValueError(f"Unsupported target layer(s) {unknown}; choose from {TARGET_LAYERS}")
+            raise ValueError(
+                f"Unsupported target layer(s): {unknown}; choose from {TARGET_LAYERS}"
+            )
+        if not target_layers:
+            raise ValueError("At least one target layer must be provided.")
+        if not hasattr(model, "densenet"):
+            raise AttributeError(
+                "Expected model.densenet; check the model.py implementation."
+            )
         self.model = model
         self.densenet = model.densenet
         self.target_layers = tuple(target_layers)
 
     def compute(self, input_tensor):
         """
-        Args:
-            input_tensor: normalized image batch of shape (1, 3, H, W).
-        Returns:
-            cams: {layer: np.ndarray (H, W) in [0, 1], upsampled to the input size}
-            prob: predicted pneumonia probability (float).
+        input_tensor: normalized batch of one image, shape (1, 3, H, W).
+        Returns {layer: normalized HxW CAM}, pneumonia probability.
         """
-        self.model.eval()
-        x = input_tensor
+        if input_tensor.ndim != 4 or input_tensor.shape[0] != 1:
+            raise ValueError("Expected input shape (1, 3, H, W).")
 
+        self.model.eval()
+        captured = {}
+
+        # Explicitly replay DenseNet so the desired feature maps retain gradients.
         with torch.enable_grad():
-            captured = {}
-            h = x
+            h = input_tensor
             for name, module in self.densenet.features.named_children():
                 h = module(h)
                 if name == "norm5":
                     h = F.relu(h)
                 if name in self.target_layers:
                     captured[name] = h
+
+            missing = set(self.target_layers) - set(captured)
+            if missing:
+                raise RuntimeError(f"Could not capture target layers: {missing}")
+
             pooled = F.adaptive_avg_pool2d(h, (1, 1)).flatten(1)
-            logit = self.densenet.classifier(pooled)
-            names = list(captured)
-            grads = torch.autograd.grad(logit.sum(), [captured[n] for n in names])
+            logits = self.densenet.classifier(pooled)
+            if logits.numel() != 1:
+                raise ValueError(
+                    f"Expected one logit for one image; got {tuple(logits.shape)}"
+                )
+
+            grads = torch.autograd.grad(
+                logits.sum(),
+                [captured[name] for name in self.target_layers],
+            )
 
         cams = {}
-        for name, grad in zip(names, grads):
-            activations = captured[name]
-            # Channel weights = global-average-pooled gradients of the pneumonia logit.
+        for name, grad in zip(self.target_layers, grads):
+            activation = captured[name]
             weights = grad.mean(dim=(2, 3), keepdim=True)
-            cam = F.relu((weights * activations).sum(dim=1, keepdim=True))
-            cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            cam = cam[0, 0].detach().cpu().numpy()
-            cam -= cam.min()
-            if cam.max() > 0:
-                cam /= cam.max()
-            cams[name] = cam.astype(np.float32)
+            cam = F.relu((weights * activation).sum(dim=1, keepdim=True))
+            cam = F.interpolate(
+                cam, size=input_tensor.shape[-2:],
+                mode="bilinear", align_corners=False
+            )[0, 0].detach().cpu().numpy()
+            cam = np.asarray(cam, dtype=np.float32)
+            cam -= float(cam.min())
+            maximum = float(cam.max())
+            if maximum > 0:
+                cam /= maximum
+            cams[name] = cam
 
-        prob = torch.sigmoid(logit).item()
-        return cams, prob
+        return cams, torch.sigmoid(logits).item()
 
     def __call__(self, input_tensor):
-        """Heatmap for the first target layer: returns (cam, prob)."""
-        cams, prob = self.compute(input_tensor)
-        return cams[self.target_layers[0]], prob
+        cams, probability = self.compute(input_tensor)
+        return cams[self.target_layers[0]], probability
+
+
+def resize_cam(cam, size):
+    """Resize a 2D CAM to (width, height), retaining values in [0, 1]."""
+    cam = np.asarray(cam, dtype=np.float32)
+    if cam.ndim != 2 or not np.isfinite(cam).all():
+        raise ValueError("CAM must be a finite 2D array.")
+    cam = np.clip(cam, 0.0, 1.0)
+    image = Image.fromarray(np.round(cam * 255).astype(np.uint8))
+    image = image.resize(size, Image.Resampling.BILINEAR)
+    return np.asarray(image, dtype=np.float32) / 255.0
 
 
 def explain_multi(model, pil_image, device=None, target_layers=("norm5",), flip_tta=False):
     """
-    Grad-CAM for several layers in one pass.
-    flip_tta also explains the horizontally mirrored image (train.py trains with
-    RandomHorizontalFlip), mirrors that heatmap back and averages the two.
-
-    Returns ({(layer, flip_tta): cam at original size}, probability). When flip_tta
-    is True both the plain and the averaged heatmaps are returned. The probability
-    is always for the unflipped image, matching evaluate.py.
+    Generate CAMs for multiple layers. If flip_tta=True, also return a CAM
+    averaged with the horizontally flipped image's mirrored-back CAM.
+    Probability always corresponds to the original image.
     """
     device = device or next(model.parameters()).device
     tensor = get_eval_transform()(pil_image).unsqueeze(0).to(device)
     gradcam = GradCAM(model, target_layers)
-    cams, prob = gradcam.compute(tensor)
-    out = {(layer, False): cam for layer, cam in cams.items()}
+    cams, probability = gradcam.compute(tensor)
+    output = {(layer, False): cam for layer, cam in cams.items()}
 
     if flip_tta:
-        flipped, _ = gradcam.compute(torch.flip(tensor, dims=[3]))
+        flipped_cams, _ = gradcam.compute(torch.flip(tensor, dims=[3]))
         for layer, cam in cams.items():
-            avg = (cam + flipped[layer][:, ::-1]) / 2
-            out[(layer, True)] = avg / avg.max() if avg.max() > 0 else avg
+            flipped_back = flipped_cams[layer][:, ::-1].copy()
+            average = (cam + flipped_back) / 2.0
+            maximum = float(average.max())
+            if maximum > 0:
+                average = average / maximum
+            output[(layer, True)] = average.astype(np.float32)
 
-    return {k: resize_cam(v, pil_image.size) for k, v in out.items()}, prob
+    return {
+        key: resize_cam(cam, pil_image.size) for key, cam in output.items()
+    }, probability
 
 
 def explain(model, pil_image, device=None, target_layer="norm5", flip_tta=False):
-    """Run preprocessing + Grad-CAM on a PIL image; returns (cam at original size, probability)."""
-    cams, prob = explain_multi(model, pil_image, device, (target_layer,), flip_tta)
-    return cams[(target_layer, flip_tta)], prob
-
-
-def resize_cam(cam, size):
-    """Resize a [0, 1] heatmap to (width, height) of the original image."""
-    cam_img = Image.fromarray((cam * 255).astype(np.uint8)).resize(size, Image.BILINEAR)
-    return np.asarray(cam_img, dtype=np.float32) / 255.0
+    """Return (CAM at original image size, pneumonia probability)."""
+    if target_layer not in TARGET_LAYERS:
+        raise ValueError(f"target_layer must be one of {TARGET_LAYERS}")
+    cams, probability = explain_multi(
+        model, pil_image, device, (target_layer,), flip_tta
+    )
+    return cams[(target_layer, flip_tta)], probability
 
 
 def overlay_heatmap(pil_image, cam, alpha=0.4, colormap="jet"):
-    """Blend a [0, 1] heatmap (same size as image) over the X-ray. Returns an RGB uint8 array."""
+    """
+    Blend a positive-evidence CAM over the X-ray.
+    An all-zero CAM returns the original image unchanged; callers should label
+    this case 'No positive Grad-CAM evidence' rather than showing a false map.
+    """
     import matplotlib
-    cmap = matplotlib.colormaps[colormap]
-    heat = (cmap(cam)[..., :3] * 255).astype(np.float32)
+
+    cam = np.asarray(cam, dtype=np.float32)
+    if cam.ndim != 2 or not np.isfinite(cam).all():
+        raise ValueError("CAM must be a finite 2D array.")
+    if cam.shape != (pil_image.height, pil_image.width):
+        raise ValueError("CAM dimensions must match the image dimensions.")
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1.")
+
     base = np.asarray(pil_image.convert("RGB"), dtype=np.float32)
-    blended = (1 - alpha) * base + alpha * heat
-    return np.clip(blended, 0, 255).astype(np.uint8)
+    if float(cam.max()) <= 0:
+        return base.astype(np.uint8)
+
+    cam = np.clip(cam, 0.0, 1.0)
+    heat = (matplotlib.colormaps[colormap](cam)[..., :3] * 255).astype(np.float32)
+    return np.clip((1 - alpha) * base + alpha * heat, 0, 255).astype(np.uint8)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate a Grad-CAM heatmap for one chest X-ray")
-    parser.add_argument("--image", type=str, required=True, help="Path to a .dcm/.png/.jpg X-ray")
-    parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT,
-                        help="Path to best_model.pth")
-    parser.add_argument("--output", type=str, default="gradcam_output.png",
-                        help="Where to save the overlay figure")
-    parser.add_argument("--target_layer", type=str, default="norm5", choices=TARGET_LAYERS)
-    parser.add_argument("--flip_tta", action="store_true", help="Average with the mirrored image's heatmap")
+    parser = argparse.ArgumentParser(
+        description="Generate Grad-CAM for one chest X-ray."
+    )
+    parser.add_argument("--image", required=True, help="Path to .dcm, .png, or .jpg")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--output", default="gradcam_output.png")
+    parser.add_argument("--target_layer", choices=TARGET_LAYERS, default="norm5")
+    parser.add_argument("--flip_tta", action="store_true")
     args = parser.parse_args()
 
     import matplotlib
@@ -209,18 +244,33 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
     image = load_image(args.image)
-    cam, prob = explain(model, image, device, args.target_layer, args.flip_tta)
+    cam, probability = explain(
+        model, image, device, args.target_layer, args.flip_tta
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].imshow(image, cmap="gray")
+    axes[0].imshow(image)
     axes[0].set_title("Input X-ray")
     axes[1].imshow(overlay_heatmap(image, cam))
-    axes[1].set_title(f"Grad-CAM (P(pneumonia) = {prob:.3f})")
+    if float(cam.max()) <= 0:
+        axes[1].set_title(
+            f"No positive Grad-CAM evidence\nP(pneumonia) = {probability:.4f}"
+        )
+    else:
+        axes[1].set_title(
+            f"Grad-CAM ({args.target_layer})\nP(pneumonia) = {probability:.4f}"
+        )
     for ax in axes:
         ax.axis("off")
     fig.tight_layout()
-    fig.savefig(args.output, dpi=120)
-    print(f"P(pneumonia) = {prob:.4f}")
+    fig.savefig(args.output, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"P(pneumonia) = {probability:.4f}")
+    print(f"Target layer = {args.target_layer}")
+    print(f"CAM range = [{float(cam.min()):.4f}, {float(cam.max()):.4f}]")
+    if float(cam.max()) <= 0:
+        print("Warning: no positive Grad-CAM evidence for this image.")
     print(f"Saved Grad-CAM overlay to: {args.output}")
 
 
