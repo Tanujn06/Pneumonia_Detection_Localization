@@ -20,7 +20,7 @@ from gradcam import load_model, load_image, explain, overlay_heatmap
 
 # Change this to the location of your downloaded checkpoint.
 CHECKPOINT = Path(
-    r"C:\Pneumonia_Project\checkpoint1\best_model.pth"
+    "drive\MyDrive\Pneumonia_Project\checkpoint1\best_model.pth"
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
