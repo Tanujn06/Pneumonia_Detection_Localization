@@ -1,0 +1,10 @@
+{
+    "layer": "norm5",
+    "threshold": 0.5,
+    "n_patients": 100,
+    "mean_mask_iou_all_true_positives": 0.17096783070252924,
+    "mean_iou_paper_style": 0.1364298988729289,
+    "pointing_game": 0.22,
+    "classifier_sensitivity_on_these": 0.48,
+    "images_with_no_box": 6
+}
